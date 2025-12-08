@@ -1,84 +1,177 @@
+// third-party/htif/src/htif.rs
+//
+// HTIF implementation for Spike/fesvr-style hosts.
+// Packet format (by convention; must match host):
+//   - bits 63..56: device (8 bits)
+//   - bits 55..48: command (8 bits)
+//   - bits 47..0 : payload (48 bits)
+//
+// Assumptions (contract with host):
+//   - Only one outstanding packet in `tohost` at a time.
+//   - Host clears `tohost` to 0 after processing a command (ack).
+//   - Host writes responses to `fromhost`; we clear `fromhost` to 0 after consuming.
+//   - Console GETCHAR is request→response; unsolicited host traffic may be ignored.
+//
+// Notes:
+//   - Place `#![no_std]` in your crate root (e.g., src/lib.rs), not here.
+//   - For SMP/interrupts, guard `send_packet` with a spinlock to avoid concurrent writers.
+//   - Device/command IDs follow a common convention (0=syscall, 1=console). Adjust if your host differs.
+
+use core::arch::asm;
+
+#[repr(align(64))]
+pub struct Aligned64(u64);
+
 #[link_section = ".tohost"]
 #[used]
 #[no_mangle]
-pub static mut tohost: u64 = 0;
+pub static mut tohost: Aligned64 = Aligned64(0);
 
 #[link_section = ".fromhost"]
 #[used]
 #[no_mangle]
-pub static mut fromhost: u64 = 0;
+pub static mut fromhost: Aligned64 = Aligned64(0);
 
-const HTIF_DEVICE_SYSCALL: u64 = 0x0000; // Syscall device
-const HTIF_DEVICE_CONSOLE: u64 = 0x0001; // Console output device
+pub const DEV_SYSCALL: u64 = 0x00;
+pub const DEV_CONSOLE: u64 = 0x01;
 
-const HTIF_CMD_SYSCALL: u64 = 0; // Command for SYSCALL
-const HTIF_CMD_GETCHAR: u64 = 0; // Command for GETCHAR
-const HTIF_CMD_PUTCHAR: u64 = 1; // Command for PUTCHAR
+pub const CMD_SYSCALL: u64 = 0x00;
+pub const CMD_GETCHAR: u64 = 0x00;
+pub const CMD_PUTCHAR: u64 = 0x01;
+
+// Packet fields
+const DEV_SHIFT: u64 = 56;
+const CMD_SHIFT: u64 = 48;
+const PAYLOAD_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 
 #[inline(always)]
-fn write_tohost(device: u64, cmd: u64, payload: u64) {
-    unsafe {
-        core::ptr::write_volatile(
-            &raw mut tohost,
-            ((device & 0xFF) << 56) | ((cmd & 0xFF) << 48) | (payload & 0xFFFF_FFFF_FFFF),
-        );
-    }
+fn encode_packet(device: u64, cmd: u64, payload: u64) -> u64 {
+    ((device & 0xFF) << DEV_SHIFT) | ((cmd & 0xFF) << CMD_SHIFT) | (payload & PAYLOAD_MASK)
 }
 
-/// Read a response from the host
 #[inline(always)]
-pub fn read_fromhost() -> u64 {
-    unsafe { core::ptr::read_volatile(&raw const fromhost) }
+fn decode_packet(word: u64) -> (u64, u64, u64) {
+    let device = (word >> DEV_SHIFT) & 0xFF;
+    let cmd = (word >> CMD_SHIFT) & 0xFF;
+    let payload = word & PAYLOAD_MASK;
+    (device, cmd, payload)
 }
 
-/// Exit to host with the given code (0 = success)
-pub fn exit(code: u32) -> ! {
-    write_tohost(
-        HTIF_DEVICE_SYSCALL,
-        HTIF_CMD_SYSCALL,
-        ((code << 1) | 1) as u64,
-    );
-    loop {
+#[inline(always)]
+fn read_tohost() -> u64 {
+    unsafe { core::ptr::read_volatile(core::ptr::addr_of!(tohost.0)) }
+}
+
+#[inline(always)]
+fn write_tohost(word: u64) {
+    unsafe { core::ptr::write_volatile(core::ptr::addr_of_mut!(tohost.0), word) }
+}
+
+#[inline(always)]
+fn read_fromhost() -> u64 {
+    unsafe { core::ptr::read_volatile(core::ptr::addr_of!(fromhost.0)) }
+}
+
+#[inline(always)]
+fn write_fromhost(word: u64) {
+    unsafe { core::ptr::write_volatile(core::ptr::addr_of_mut!(fromhost.0), word) }
+}
+
+// Wait until tohost is 0 (idle)
+#[inline(always)]
+fn wait_tohost_idle() {
+    while read_tohost() != 0 {
         core::hint::spin_loop();
     }
 }
 
+// After sending, wait until host clears tohost (ack)
+#[inline(always)]
 fn wait_tohost_ack() {
-    unsafe {
-        // Wait until tohost is cleared by the host
-        while core::ptr::read_volatile(&raw const tohost) != 0 {
-            // Busy wait or yield if in a cooperative environment
-            core::hint::spin_loop();
-        }
+    while read_tohost() != 0 {
+        core::hint::spin_loop();
     }
 }
 
-/// Write a single byte to the HTIF console
-pub fn putchar(ch: u8) {
-    write_tohost(HTIF_DEVICE_CONSOLE, HTIF_CMD_PUTCHAR, ch as u64);
-    // Wait for the host to process the command (tohost will be cleared)
+/// Send a packet to the host via `tohost` (Wait–Write–Wait).
+#[inline(always)]
+pub fn send_packet(device: u64, cmd: u64, payload: u64) {
+    wait_tohost_idle();
+    write_tohost(encode_packet(device, cmd, payload));
     wait_tohost_ack();
 }
 
-pub fn getchar() -> u8 {
-    write_tohost(HTIF_DEVICE_CONSOLE, HTIF_CMD_GETCHAR, 0);
-    wait_tohost_ack();
-
-    let response = read_fromhost();
-
+/// Blocking receive of a packet from the host via `fromhost`.
+/// Returns (device, command, payload) and clears `fromhost` to 0.
+#[inline(always)]
+pub fn recv_packet() -> (u64, u64, u64) {
     loop {
-        // Check if valid character received (implementation dependent)
-        if response & 0x100 != 0 {
-            // Example: bit 8 indicates valid char
-            return (response & 0xFF) as u8;
+        let word = read_fromhost();
+        if word != 0 {
+            let pkt = decode_packet(word);
+            write_fromhost(0);
+            return pkt;
         }
         core::hint::spin_loop();
     }
 }
 
-/// Perform a syscall with the given payload
-/// (the payload layout must match expected syscall ABI)
-pub fn syscall(payload: u64) {
-    // FIXME:
-    write_tohost(HTIF_DEVICE_SYSCALL, HTIF_CMD_SYSCALL, payload);
+/// Non-blocking receive of a packet from the host via `fromhost`.
+/// Returns Some((device, command, payload)) if present; clears `fromhost` on success.
+#[inline(always)]
+pub fn try_recv_packet() -> Option<(u64, u64, u64)> {
+    let word = read_fromhost();
+    if word == 0 {
+        return None;
+    }
+    let pkt = decode_packet(word);
+    write_fromhost(0);
+    Some(pkt)
+}
+
+/// Exit to host with the given code (0 = success).
+/// Convention: payload = ((code << 1) | 1) on SYSCALL device/cmd.
+pub fn exit(code: u32) -> ! {
+    let payload = ((code as u64) << 1) | 1;
+    send_packet(DEV_SYSCALL, CMD_SYSCALL, payload);
+    loop {
+        // Host will terminate the simulation; either spin or use wfi.
+        unsafe { asm!("wfi") };
+    }
+}
+
+/// Write a single byte to the HTIF console.
+pub fn putchar(ch: u8) {
+    send_packet(DEV_CONSOLE, CMD_PUTCHAR, ch as u64);
+}
+
+/// Read a single byte from the HTIF console (blocking).
+pub fn getchar() -> u8 {
+    // Request input
+    send_packet(DEV_CONSOLE, CMD_GETCHAR, 0);
+
+    // Wait for matching response on fromhost
+    loop {
+        let (dev, cmd, payload) = recv_packet();
+        if dev == DEV_CONSOLE && cmd == CMD_GETCHAR {
+            return (payload & 0xFF) as u8;
+        }
+        // Ignore unrelated responses
+    }
+}
+
+/// Perform a syscall via HTIF and return the host's payload (result).
+/// Your ABI defines how arguments/results are packed into `payload`.
+pub fn syscall(payload: u64) -> u64 {
+    // Send syscall request
+    send_packet(DEV_SYSCALL, CMD_SYSCALL, payload);
+
+    // Wait for syscall result from host
+    loop {
+        let (dev, cmd, resp) = recv_packet();
+        if dev == DEV_SYSCALL && cmd == CMD_SYSCALL {
+            return resp;
+        }
+        // Ignore unrelated responses
+    }
 }
